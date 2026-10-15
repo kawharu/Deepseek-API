@@ -3,14 +3,21 @@
 DeepSeek's protocol has no system/role channel — just a single `prompt` string.
 So we flatten the OpenAI `messages` array into one prompt, and wrap DeepSeek's
 text output back into OpenAI response/stream objects.
+
+Because DeepSeek's model doesn't speak OpenAI's native tool-call format, we
+implement a *shim*: incoming `tools` become a prompt-level instruction that
+asks the model to emit JSON like {"tool_calls":[...]}; we then parse that JSON
+out of the model's text and translate it into OpenAI's `tool_calls` shape in
+the response.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Union
 
 from .schemas import ChatMessage
 
@@ -30,20 +37,137 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
-def messages_to_prompt(messages: List[ChatMessage]) -> str:
+def _format_tools(tools: List[dict],
+                  tool_choice: Optional[Union[str, dict]] = None) -> str:
+    """Turn OpenAI tool definitions into a prompt-level instruction.
+
+    DeepSeek has no native tool schema, so we describe the functions in prose
+    and ask the model to emit a strict JSON block.
+    """
+    if not tools:
+        return ""
+
+    tool_descs = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        func = tool.get("function", {})
+        name = func.get("name", "")
+        desc = func.get("description", "")
+        params = func.get("parameters", {})
+        tool_descs.append(
+            f"- {name}: {desc}\n"
+            f"  Parameters: {json.dumps(params, ensure_ascii=False, indent=2)}"
+        )
+
+    if not tool_descs:
+        return ""
+
+    instruction = (
+        "You have access to the following functions. To call a function, "
+        "respond **only** with a JSON object in this exact format:\n"
+        "{'tool_calls': [{'name': 'function_name', 'arguments': {...}}]}\n"
+        "Do not include any other text when calling a function.\n"
+        "If you do not need to call a function, respond normally.\n\n"
+        "Available functions:\n" + "\n".join(tool_descs)
+    )
+
+    if tool_choice == "none":
+        instruction += "\n\nDo not call any functions."
+    elif tool_choice == "required":
+        instruction += "\n\nYou must call one of the functions."
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        forced = tool_choice.get("function", {}).get("name", "")
+        instruction += f"\n\nYou must call the function '{forced}'."
+
+    return instruction
+
+
+def parse_tool_calls(text: str) -> Optional[List[dict]]:
+    """Extract tool calls from the model's raw text output.
+
+    Returns OpenAI-style ``tool_calls`` objects, or ``None`` when no function
+    call JSON is found.
+    """
+    # Look for a JSON object that contains "tool_calls"
+    match = re.search(r'\{[\s\S]*"tool_calls"[\s\S]*\}', text)
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group())
+    except json.JSONDecodeError:
+        return None
+
+    raw_calls = data.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return None
+
+    result = []
+    for tc in raw_calls:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("name")
+        args = tc.get("arguments", {})
+        if not name:
+            continue
+        if isinstance(args, dict):
+            args_str = json.dumps(args, ensure_ascii=False)
+        else:
+            args_str = str(args)
+        result.append({
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": name, "arguments": args_str},
+        })
+    return result if result else None
+
+
+def messages_to_prompt(
+    messages: List[ChatMessage],
+    tools: Optional[List[dict]] = None,
+    tool_choice: Optional[Union[str, dict]] = None,
+) -> str:
     """Flatten a chat history into a single prompt DeepSeek can answer.
 
-    A lone user message is sent verbatim. Multi-turn / system-prompted
-    conversations are serialised with role labels and a trailing 'Assistant:'
-    cue so the model continues in the right voice.
+    A lone user message with no tools is sent verbatim. Multi-turn /
+    system-prompted conversations are serialised with role labels and a
+    trailing 'Assistant:' cue so the model continues in the right voice.
+
+    ``tools`` (when present) is rendered as an instruction block at the top.
+    Tool-result and prior assistant-with-tool-calls messages are rendered so
+    the model sees the call/answer pair.
     """
-    if len(messages) == 1 and messages[0].role == "user":
+    tool_instruction = _format_tools(tools, tool_choice) if tools else ""
+
+    # A lone user message with no tools is sent verbatim (legacy behaviour).
+    if len(messages) == 1 and messages[0].role == "user" and not tools:
         return _text_of(messages[0].content)
 
     lines = []
+    if tool_instruction:
+        lines.append(f"System: {tool_instruction}")
+
     for m in messages:
-        label = _ROLE_LABELS.get(m.role, m.role.capitalize())
-        lines.append(f"{label}: {_text_of(m.content)}")
+        if m.role == "tool":
+            # Tool result (the client's answer to a tool call).
+            lines.append(f"Tool result: {_text_of(m.content)}")
+        elif m.role == "assistant" and m.tool_calls:
+            # Assistant message that originally emitted tool calls.
+            calls = []
+            for tc in m.tool_calls:
+                func = tc.get("function", {})
+                calls.append({
+                    "name": func.get("name"),
+                    "arguments": func.get("arguments"),
+                })
+            lines.append(
+                f"Assistant: {json.dumps({'tool_calls': calls}, ensure_ascii=False)}"
+            )
+        else:
+            label = _ROLE_LABELS.get(m.role, m.role.capitalize())
+            lines.append(f"{label}: {_text_of(m.content)}")
+
     lines.append("Assistant:")
     return "\n\n".join(lines)
 
@@ -61,14 +185,32 @@ def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def completion_response(model: str, content: str, prompt: str,
-                        conversation_id: str = None) -> dict:
+def completion_response(
+    model: str,
+    content: str,
+    prompt: str,
+    conversation_id: str = None,
+    tool_calls: Optional[List[dict]] = None,
+) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
+
+    When ``tool_calls`` is present the message is shaped to OpenAI's spec:
+    ``content`` becomes ``null`` and ``finish_reason`` is ``"tool_calls"``.
 
     `conversation_id` is an extra top-level field (outside OpenAI's schema) you
     send back to resume the conversation.
     """
     pt, ct = _est_tokens(prompt), _est_tokens(content)
+
+    message = {"role": "assistant", "content": content}
+    finish_reason = "stop"
+
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        # OpenAI sets content to null when tool_calls are present.
+        message["content"] = None
+        finish_reason = "tool_calls"
+
     return {
         "id": _id(),
         "object": "chat.completion",
@@ -78,8 +220,8 @@ def completion_response(model: str, content: str, prompt: str,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -90,15 +232,23 @@ def completion_response(model: str, content: str, prompt: str,
     }
 
 
-def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
-    """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
+def stream_chunks(
+    model: str,
+    stream: Iterable[str],
+    prompt: str = "",
+) -> Iterable[str]:
+    """Yield OpenAI SSE lines (`data: {...}\n\n`) for a streamed completion.
 
     `stream` is the client's stream object; after it's consumed we read its
     `.conversation_id` and attach it to the final chunk.
+
+    Because the model may emit a JSON tool-call block mid-stream, we buffer the
+    full output first, then decide whether the response is a tool call or plain
+    text. Text responses still stream token by token.
     """
     cid, created = _id(), _now()
 
-    def frame(delta: dict, finish=None, extra: dict = None) -> str:
+    def frame(delta: dict, finish=None, extra: dict = None) -> dict:
         obj = {
             "id": cid,
             "object": "chat.completion.chunk",
@@ -110,11 +260,26 @@ def stream_chunks(model: str, stream: Iterable[str]) -> Iterable[str]:
             obj.update(extra)
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
+    # Buffer the entire stream so we can detect a tool-call JSON block.
+    full_text = "".join(stream)
+    tool_calls = parse_tool_calls(full_text)
+
+    if tool_calls:
+        yield frame(
+            {"role": "assistant", "content": None, "tool_calls": tool_calls},
+            finish="tool_calls",
+        )
+        yield frame({}, finish="stop")
+        yield frame({}, finish=None, extra={"conversation_id": None})
+        yield "data: [DONE]\n\n"
+        return
+
+    conversation_id = getattr(stream, "conversation_id", None)
+
     # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
-    for d in stream:
+    for d in full_text:
         if d:
             yield frame({"content": d})
-    conversation_id = getattr(stream, "conversation_id", None)
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
