@@ -39,7 +39,12 @@ from .config import (
     is_known_model,
     resolve_model_type,
 )
-from .openai_format import completion_response, messages_to_prompt, stream_chunks
+from .openai_format import (
+    completion_response,
+    messages_to_prompt,
+    parse_tool_calls,
+    stream_chunks,
+)
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 

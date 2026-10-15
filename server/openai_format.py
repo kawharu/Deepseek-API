@@ -13,8 +13,8 @@ the response.
 
 from __future__ import annotations
 
+import ast
 import json
-import re
 import time
 import uuid
 from typing import Iterable, List, Optional, Union
@@ -22,6 +22,10 @@ from typing import Iterable, List, Optional, Union
 from .schemas import ChatMessage
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
+
+_BACKSLASH = chr(92)
+_DOUBLE_QUOTE = chr(34)
+_SINGLE_QUOTE = chr(39)
 
 
 def _text_of(content) -> str:
@@ -42,7 +46,9 @@ def _format_tools(tools: List[dict],
     """Turn OpenAI tool definitions into a prompt-level instruction.
 
     DeepSeek has no native tool schema, so we describe the functions in prose
-    and ask the model to emit a strict JSON block.
+    and ask the model to emit a strict JSON block. The sample is written with
+    *double quotes* on purpose: the model tends to mirror the example's style,
+    and a single-quoted sample makes it emit non-JSON output.
     """
     if not tools:
         return ""
@@ -65,10 +71,10 @@ def _format_tools(tools: List[dict],
 
     instruction = (
         "You have access to the following functions. To call a function, "
-        "respond **only** with a JSON object in this exact format:\n"
-        "{'tool_calls': [{'name': 'function_name', 'arguments': {...}}]}\n"
-        "Do not include any other text when calling a function.\n"
-        "If you do not need to call a function, respond normally.\n\n"
+        "respond with ONLY a single valid JSON object (double quotes, no "
+        "markdown, no extra text) in exactly this format:\n"
+        '{"tool_calls": [{"name": "function_name", "arguments": {"arg": "value"}}]}\n'
+        "If you do not need to call a function, respond normally in plain text.\n\n"
         "Available functions:\n" + "\n".join(tool_descs)
     )
 
@@ -78,25 +84,78 @@ def _format_tools(tools: List[dict],
         instruction += "\n\nYou must call one of the functions."
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         forced = tool_choice.get("function", {}).get("name", "")
-        instruction += f"\n\nYou must call the function '{forced}'."
+        instruction += "\n\nYou must call the function " + forced + "."
 
     return instruction
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """Return the first balanced {...} block that contains a tool_calls key.
+
+    Finds the tool_calls key, walks back to the enclosing open brace, then
+    brace-matches — string-aware, so braces inside string literals are ignored.
+    """
+    idx = text.find("tool_calls")
+    if idx == -1:
+        return None
+    start = text.rfind("{", 0, idx)
+    if start == -1:
+        return None
+
+    depth = 0
+    in_str = False
+    quote = ""
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == _BACKSLASH:
+                esc = True
+            elif ch == quote:
+                in_str = False
+        else:
+            if ch == _DOUBLE_QUOTE or ch == _SINGLE_QUOTE:
+                in_str = True
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
+def _loads_tolerant(blob: str):
+    """Parse JSON, falling back to Python-literal syntax (single quotes)."""
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(blob)
+    except Exception:
+        return None
 
 
 def parse_tool_calls(text: str) -> Optional[List[dict]]:
     """Extract tool calls from the model's raw text output.
 
-    Returns OpenAI-style ``tool_calls`` objects, or ``None`` when no function
-    call JSON is found.
+    Returns OpenAI-style `tool_calls` objects, or `None` when no function-call
+    block is found. Tolerates the model emitting single-quoted / Python-literal
+    output instead of strict JSON.
     """
-    # Look for a JSON object that contains "tool_calls"
-    match = re.search(r'\{[\s\S]*"tool_calls"[\s\S]*\}', text)
-    if not match:
+    if not text:
         return None
 
-    try:
-        data = json.loads(match.group())
-    except json.JSONDecodeError:
+    blob = _extract_json_object(text)
+    if blob is None:
+        return None
+
+    data = _loads_tolerant(blob)
+    if not isinstance(data, dict):
         return None
 
     raw_calls = data.get("tool_calls")
@@ -111,12 +170,12 @@ def parse_tool_calls(text: str) -> Optional[List[dict]]:
         args = tc.get("arguments", {})
         if not name:
             continue
-        if isinstance(args, dict):
-            args_str = json.dumps(args, ensure_ascii=False)
+        if isinstance(args, str):
+            args_str = args
         else:
-            args_str = str(args)
+            args_str = json.dumps(args, ensure_ascii=False)
         result.append({
-            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "id": "call_" + uuid.uuid4().hex[:8],
             "type": "function",
             "function": {"name": name, "arguments": args_str},
         })
@@ -134,13 +193,12 @@ def messages_to_prompt(
     system-prompted conversations are serialised with role labels and a
     trailing 'Assistant:' cue so the model continues in the right voice.
 
-    ``tools`` (when present) is rendered as an instruction block at the top.
+    `tools` (when present) is rendered as an instruction block at the top.
     Tool-result and prior assistant-with-tool-calls messages are rendered so
     the model sees the call/answer pair.
     """
     tool_instruction = _format_tools(tools, tool_choice) if tools else ""
 
-    # A lone user message with no tools is sent verbatim (legacy behaviour).
     if len(messages) == 1 and messages[0].role == "user" and not tools:
         return _text_of(messages[0].content)
 
@@ -150,10 +208,8 @@ def messages_to_prompt(
 
     for m in messages:
         if m.role == "tool":
-            # Tool result (the client's answer to a tool call).
             lines.append(f"Tool result: {_text_of(m.content)}")
         elif m.role == "assistant" and m.tool_calls:
-            # Assistant message that originally emitted tool calls.
             calls = []
             for tc in m.tool_calls:
                 func = tc.get("function", {})
@@ -194,8 +250,8 @@ def completion_response(
 ) -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
-    When ``tool_calls`` is present the message is shaped to OpenAI's spec:
-    ``content`` becomes ``null`` and ``finish_reason`` is ``"tool_calls"``.
+    When `tool_calls` is present the message is shaped to OpenAI's spec:
+    `content` becomes `null` and `finish_reason` is `"tool_calls"`.
 
     `conversation_id` is an extra top-level field (outside OpenAI's schema) you
     send back to resume the conversation.
@@ -207,7 +263,6 @@ def completion_response(
 
     if tool_calls:
         message["tool_calls"] = tool_calls
-        # OpenAI sets content to null when tool_calls are present.
         message["content"] = None
         finish_reason = "tool_calls"
 
@@ -237,10 +292,7 @@ def stream_chunks(
     stream: Iterable[str],
     prompt: str = "",
 ) -> Iterable[str]:
-    """Yield OpenAI SSE lines (`data: {...}\n\n`) for a streamed completion.
-
-    `stream` is the client's stream object; after it's consumed we read its
-    `.conversation_id` and attach it to the final chunk.
+    """Yield OpenAI SSE lines (`data: {...}` frames) for a streamed completion.
 
     Because the model may emit a JSON tool-call block mid-stream, we buffer the
     full output first, then decide whether the response is a tool call or plain
@@ -248,7 +300,7 @@ def stream_chunks(
     """
     cid, created = _id(), _now()
 
-    def frame(delta: dict, finish=None, extra: dict = None) -> dict:
+    def frame(delta: dict, finish=None, extra: dict = None) -> str:
         obj = {
             "id": cid,
             "object": "chat.completion.chunk",
@@ -258,9 +310,8 @@ def stream_chunks(
         }
         if extra:
             obj.update(extra)
-        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+        return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
-    # Buffer the entire stream so we can detect a tool-call JSON block.
     full_text = "".join(stream)
     tool_calls = parse_tool_calls(full_text)
 
@@ -270,13 +321,11 @@ def stream_chunks(
             finish="tool_calls",
         )
         yield frame({}, finish="stop")
-        yield frame({}, finish=None, extra={"conversation_id": None})
         yield "data: [DONE]\n\n"
         return
 
     conversation_id = getattr(stream, "conversation_id", None)
 
-    # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
     for d in full_text:
         if d:
